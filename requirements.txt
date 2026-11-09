@@ -1,5 +1,7 @@
-fastf1>=3.4
 numpy
 pandas
 matplotlib
+requests
+scikit-learn
+scipy
 jupyter

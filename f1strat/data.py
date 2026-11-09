@@ -1,22 +1,207 @@
-"""Loading and cleaning race lap data from FastF1."""
+"""Loading and cleaning race lap data from OpenF1 (https://openf1.org).
+
+F1's own live-timing server (used by FastF1) returns 403 to cloud machines
+such as Google Colab, so laps, stints, pit stops and race-control messages are
+pulled from the free OpenF1 API instead and reshaped into FastF1-style columns.
+"""
 from __future__ import annotations
+
+import json
+import os
+import time
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 
 DRY_COMPOUNDS = ["SOFT", "MEDIUM", "HARD"]
+OPENF1 = "https://api.openf1.org/v1"
 
 
-def load_race(year: int, gp: str | int, cache_dir: str = "data/cache"):
-    """Load a race session with FastF1 and return (session, laps)."""
-    import os
-    import fastf1
+def _get(endpoint: str, cache_dir: str, retries: int = 5, **params) -> list:
+    """GET an OpenF1 endpoint with on-disk JSON caching and retry on rate limits."""
+    import requests
 
+    key = endpoint + "_" + "_".join(f"{k}-{v}" for k, v in sorted(params.items()))
+    path = os.path.join(cache_dir, key.replace("/", "-").replace(" ", "") + ".json")
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    for attempt in range(retries):
+        r = requests.get(f"{OPENF1}/{endpoint}", params=params, timeout=60)
+        if r.status_code == 429 or r.status_code >= 500:
+            time.sleep(2 * (attempt + 1))
+            continue
+        r.raise_for_status()
+        data = r.json()
+        with open(path, "w") as f:
+            json.dump(data, f)
+        time.sleep(0.4)  # stay under the free-tier rate limit
+        return data
+    raise RuntimeError(f"OpenF1 {endpoint} failed after {retries} tries ({r.status_code})")
+
+
+def _norm(x) -> str:
+    """Lower-case and strip accents so 'Sao Paulo' matches 'São Paulo'."""
+    import unicodedata
+    return unicodedata.normalize("NFKD", str(x)).encode("ascii", "ignore").decode().lower()
+
+
+def list_races(year: int, cache_dir: str = "data/cache", session_name: str = "Race") -> pd.DataFrame:
+    """All sessions of one type in a season, in date order, with GP names."""
     os.makedirs(cache_dir, exist_ok=True)
-    fastf1.Cache.enable_cache(cache_dir)
-    session = fastf1.get_session(year, gp, "R")
-    session.load(laps=True, telemetry=False, weather=True, messages=True)
-    return session, session.laps
+    races = sorted(_get("sessions", cache_dir, year=year, session_name=session_name),
+                   key=lambda s: s["date_start"])
+    meetings = {m["meeting_key"]: m for m in _get("meetings", cache_dir, year=year)}
+    rows = [dict(Year=year, Round=i + 1, session_key=s["session_key"],
+                 EventName=meetings.get(s["meeting_key"], {}).get("meeting_name"),
+                 Circuit=s.get("circuit_short_name"), Location=s.get("location"),
+                 Country=s.get("country_name"), Date=s["date_start"][:10])
+            for i, s in enumerate(races)]
+    return pd.DataFrame(rows)
+
+
+def _find_session(year: int, gp, cache_dir: str, session_name: str = "Race"):
+    """Match a GP name ('Bahrain', 'Sao Paulo', 'Monza') or round number to a session."""
+    races = sorted(_get("sessions", cache_dir, year=year, session_name=session_name),
+                   key=lambda s: s["date_start"])
+    if not races:
+        raise ValueError(f"No '{session_name}' sessions found on OpenF1 for {year}")
+    meetings = {m["meeting_key"]: m for m in _get("meetings", cache_dir, year=year)}
+    if isinstance(gp, (int, np.integer)) or str(gp).isdigit():
+        return races[int(gp) - 1], meetings
+    q = _norm(gp)
+    for s in races:
+        m = meetings.get(s["meeting_key"], {})
+        names = [s.get("country_name"), s.get("location"), s.get("circuit_short_name"),
+                 m.get("meeting_name"), m.get("meeting_official_name")]
+        if any(n and q in _norm(n) for n in names):
+            return s, meetings
+    opts = [meetings.get(s["meeting_key"], {}).get("meeting_name", s.get("location")) for s in races]
+    raise ValueError(f"'{gp}' not found for {year}. Options: {opts}")
+
+
+def _neutralised_periods(rc: pd.DataFrame) -> list:
+    """(start, end, status) for SC ('4'), red flag ('5') and VSC ('6') periods."""
+    if rc.empty:
+        return []
+    rc = rc.sort_values("date")
+    msg = rc["message"].fillna("").str.upper()
+    flag = rc["flag"].fillna("").str.upper() if "flag" in rc else pd.Series("", index=rc.index)
+    out, open_ = [], {}
+    for t, m, f in zip(rc["date"], msg, flag):
+        if "VIRTUAL SAFETY CAR DEPLOYED" in m:
+            open_["6"] = t
+        elif "SAFETY CAR DEPLOYED" in m:
+            open_["4"] = t
+        elif f == "RED":
+            open_["5"] = t
+        if "6" in open_ and "VIRTUAL SAFETY CAR ENDING" in m:
+            out.append((open_.pop("6"), t + pd.Timedelta(seconds=30), "6"))
+        if "4" in open_ and "SAFETY CAR IN THIS LAP" in m:
+            # SC peels off during this lap; keep the restart lap marked too
+            out.append((open_.pop("4"), t + pd.Timedelta(seconds=120), "4"))
+        if "5" in open_ and f == "GREEN" and "PIT EXIT" not in m:
+            out.append((open_.pop("5"), t, "5"))
+    end = rc["date"].max()
+    out += [(s, end, k) for k, s in open_.items()]
+    return out
+
+
+def _weather_summary(wx: pd.DataFrame) -> dict:
+    if wx.empty:
+        return dict(TrackTemp=np.nan, AirTemp=np.nan, Humidity=np.nan, Rain=False)
+    g = lambda c: float(pd.to_numeric(wx[c], errors="coerce").mean()) if c in wx else np.nan
+    rain = bool(pd.to_numeric(wx.get("rainfall", pd.Series([0])), errors="coerce").fillna(0).gt(0).any())
+    return dict(TrackTemp=g("track_temperature"), AirTemp=g("air_temperature"),
+                Humidity=g("humidity"), Rain=rain)
+
+
+def load_race(year: int, gp: str | int, cache_dir: str = "data/cache",
+              session_name: str = "Race", with_position: bool = True):
+    """Load a race (or sprint: session_name="Sprint") from OpenF1 and return (session, laps).
+
+    `laps` has FastF1-style columns: Driver, Team, LapNumber, LapTime, Stint,
+    Compound, TyreLife, PitInTime, PitOutTime, TrackStatus, IsAccurate, Position.
+    Also keeps speed traps (I1/I2/ST speed) and sector times, plus Year/Circuit.
+    `session.event["EventName"]` holds the GP name; `session.weather` holds
+    race-average track/air temperature, humidity and whether it rained.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    sess, meetings = _find_session(year, gp, cache_dir, session_name)
+    sk = sess["session_key"]
+
+    laps = pd.DataFrame(_get("laps", cache_dir, session_key=sk))
+    stints = pd.DataFrame(_get("stints", cache_dir, session_key=sk))
+    pits = pd.DataFrame(_get("pit", cache_dir, session_key=sk))
+    drivers = pd.DataFrame(_get("drivers", cache_dir, session_key=sk))
+    rc = pd.DataFrame(_get("race_control", cache_dir, session_key=sk))
+    pos = (pd.DataFrame(_get("position", cache_dir, session_key=sk)) if with_position
+           else pd.DataFrame())
+    wx = pd.DataFrame(_get("weather", cache_dir, session_key=sk))
+    if laps.empty:
+        raise RuntimeError(f"OpenF1 returned no laps for {year} {gp} (session {sk})")
+
+    extra = {"i1_speed": "I1Speed", "i2_speed": "I2Speed", "st_speed": "STSpeed",
+             "duration_sector_1": "S1", "duration_sector_2": "S2", "duration_sector_3": "S3"}
+    keep = ["driver_number", "lap_number", "lap_duration", "date_start", "is_pit_out_lap"]
+    df = laps[keep + [c for c in extra if c in laps]].rename(columns=extra).copy()
+    df["date_start"] = pd.to_datetime(df["date_start"], utc=True, format="ISO8601")
+    df["LapTime"] = pd.to_timedelta(df["lap_duration"], unit="s")
+
+    # Driver code / team
+    d = drivers.drop_duplicates("driver_number").set_index("driver_number")
+    df["Driver"] = df["driver_number"].map(d["name_acronym"]).fillna(df["driver_number"].astype(str))
+    df["Team"] = df["driver_number"].map(d["team_name"])
+
+    # Stint, compound and tyre age from the stints table
+    df["Stint"], df["Compound"], df["TyreLife"] = np.nan, None, np.nan
+    for st in stints.itertuples():
+        if pd.isna(st.lap_start):
+            continue
+        lap_end = st.lap_end if pd.notna(st.lap_end) else df["lap_number"].max()
+        m = ((df["driver_number"] == st.driver_number)
+             & df["lap_number"].between(st.lap_start, lap_end))
+        df.loc[m, "Stint"] = st.stint_number
+        df.loc[m, "Compound"] = (st.compound or "UNKNOWN").upper()
+        age0 = st.tyre_age_at_start if pd.notna(st.tyre_age_at_start) else 0
+        df.loc[m, "TyreLife"] = age0 + df.loc[m, "lap_number"] - st.lap_start + 1
+
+    # Pit in-laps (OpenF1 lap_number = lap the car entered the pits) and out-laps
+    df["PitInTime"] = pd.Series(pd.NaT, index=df.index, dtype="timedelta64[ns]")
+    df["PitOutTime"] = pd.Series(pd.NaT, index=df.index, dtype="timedelta64[ns]")
+    if not pits.empty:
+        pin = set(zip(pits["driver_number"], pits["lap_number"]))
+        m = [(a, b) in pin for a, b in zip(df["driver_number"], df["lap_number"])]
+        df.loc[m, "PitInTime"] = pd.Timedelta(1, "s")
+    df.loc[df["is_pit_out_lap"].fillna(False).astype(bool), "PitOutTime"] = pd.Timedelta(1, "s")
+
+    # Track status per lap from SC / VSC / red-flag periods
+    df["TrackStatus"] = "1"
+    if not rc.empty:
+        rc["date"] = pd.to_datetime(rc["date"], utc=True, format="ISO8601")
+        lap_end_t = df["date_start"] + df["LapTime"].fillna(pd.Timedelta(seconds=100))
+        for start, end, status in _neutralised_periods(rc):
+            hit = (df["date_start"] < end) & (lap_end_t > start)
+            df.loc[hit, "TrackStatus"] = status
+
+    df["IsAccurate"] = df["lap_duration"].notna() & df["date_start"].notna()
+
+    # Final classified position (for comparing with actual strategies)
+    if not pos.empty:
+        final = pos.sort_values("date").groupby("driver_number")["position"].last()
+        df["Position"] = df["driver_number"].map(final)
+
+    df = df.rename(columns={"lap_number": "LapNumber"})
+    df["Year"] = year
+    df["Circuit"] = sess.get("circuit_short_name") or sess.get("location")
+    df = df.sort_values(["Driver", "LapNumber"]).reset_index(drop=True)
+    meeting = meetings.get(sess["meeting_key"], {})
+    session = SimpleNamespace(
+        event={"EventName": meeting.get("meeting_name", f"{sess.get('country_name')} Grand Prix"),
+               "Location": sess.get("location")},
+        session_key=sk, info=sess, weather=_weather_summary(wx))
+    return session, df
 
 
 def clean_laps(laps: pd.DataFrame, outlier_pct: float = 1.07) -> pd.DataFrame:
