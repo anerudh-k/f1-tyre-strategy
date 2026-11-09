@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, RegressorMixin
 
-from .data import (DRY_COMPOUNDS, clean_laps, fuel_correct, list_races, load_race,
+from .data import (DRY_COMPOUNDS, NoDataError, clean_laps, fuel_correct, list_races, load_race,
                    pit_loss_from_session)
 from .degradation import DegModel
 
@@ -57,11 +57,17 @@ def build_dataset(years=(2023, 2024, 2025), cache_dir: str = "data/cache",
             tag = f"{year} R{r.Round:02d} {r.EventName}"
             try:
                 sess, raw = load_race(year, r.Round, cache_dir, with_position=False)
-            except Exception as e:  # missing / incomplete sessions are recorded, not fatal
+            except NoDataError as e:   # cancelled / future / unpublished: expected, not an error
                 race_rows.append(dict(Year=year, Round=r.Round, EventName=r.EventName,
-                                      Circuit=r.Circuit, Status=f"FAILED: {type(e).__name__}"))
+                                      Circuit=r.Circuit, Status=f"skipped: {e}"))
                 if verbose:
-                    print(f"{tag:45s} FAILED ({e})")
+                    print(f"{tag:45s} skipped - {e}")
+                continue
+            except Exception as e:      # anything else is recorded, not fatal
+                race_rows.append(dict(Year=year, Round=r.Round, EventName=r.EventName,
+                                      Circuit=r.Circuit, Status=f"FAILED: {type(e).__name__}: {e}"[:150]))
+                if verbose:
+                    print(f"{tag:45s} FAILED - {type(e).__name__}: {e}")
                 continue
             total = int(raw["LapNumber"].max())
             comps = raw["Compound"].value_counts().to_dict()
@@ -74,7 +80,9 @@ def build_dataset(years=(2023, 2024, 2025), cache_dir: str = "data/cache",
                                    .agg(lambda s: (s.astype(str) != "1").mean() > 0.5).sum()),
                         HadSC=bool((raw["TrackStatus"].astype(str) == "4").any()),
                         WetLaps=wet_laps, RainfallSeen=sess.weather["Rain"],
-                        Rain=wet_laps > 0,      # wet = intermediates/wets actually used
+                        # wet race = more than 10% of laps on inters/wets (a few laps
+                        # on inters at a dry race are just a gamble, not a wet race)
+                        Rain=wet_laps > 0.10 * len(raw),
                         PitLoss=pit_loss_from_session(raw),
                         **{f"Laps_{c}": comps.get(c, 0) for c in DRY_COMPOUNDS},
                         **_race_features(raw),
@@ -97,7 +105,28 @@ def build_dataset(years=(2023, 2024, 2025), cache_dir: str = "data/cache",
                 df[k] = info[k]
             lap_frames.append(df)
     laps = pd.concat(lap_frames, ignore_index=True) if lap_frames else pd.DataFrame()
-    return laps, pd.DataFrame(race_rows)
+    races = pd.DataFrame(race_rows)
+    if not laps.empty:
+        laps, races = _impute_track_features(laps, races, verbose)
+    return laps, races
+
+
+def _impute_track_features(laps, races, verbose=True):
+    """A missing circuit descriptor (e.g. a broken speed trap) is filled with the
+    same circuit's value from other years, so one bad sensor doesn't drop a race."""
+    cols = TRACK_FEATURES + WEATHER_FEATURES
+    ok = races["Status"] == "ok"
+    for c in cols:
+        miss = ok & races[c].isna()
+        if miss.any():
+            fill = races[ok].groupby("Circuit")[c].median()
+            races.loc[miss, c] = races.loc[miss, "Circuit"].map(fill)
+            if verbose:
+                print(f"filled missing {c} for {races.loc[miss, 'RaceId'].tolist()}")
+    m = races[ok].set_index("RaceId")
+    for c in cols:
+        laps[c] = laps["RaceId"].map(m[c])
+    return laps, races
 
 
 # --------------------------------------------------------------------- cleaning
@@ -134,7 +163,7 @@ def clean_dataset(laps: pd.DataFrame, races: pd.DataFrame, z_max: float = 3.5,
     """
     log, d = [], laps.copy()
     log.append(("start", len(d)))
-    wet = races.loc[races["Rain"].fillna(False).astype(bool), "RaceId"]
+    wet = races.loc[races["Rain"].eq(True), "RaceId"]
     d = d[~d["RaceId"].isin(set(wet))]
     log.append(("wet races", len(d)))
     n = d.groupby("RaceId")[TARGET].transform("size")
@@ -175,170 +204,224 @@ def clean_dataset(laps: pd.DataFrame, races: pd.DataFrame, z_max: float = 3.5,
     return d, rep
 
 
-# --------------------------------------------------------------------- models
-class StructuredDeg(BaseEstimator, RegressorMixin):
-    """Physics-structured model (few parameters -> hard to overfit, can extrapolate).
+# ------------------------------------------------------- per-race tyre model
+def fit_race(g: pd.DataFrame, min_laps: int = 40) -> dict | None:
+    """Separate tyre wear from fuel burn + track evolution for ONE race.
 
-        Delta = a_c + S(track) * (b1_c * age + b2_c * age^2) + e * RaceProgress
-        S(track) = exp(w . z),   z = standardised track + weather features
+        LapTime = driver pace + compound offset + LapEffect * LapNumber
+                  + Wear_compound * TyreLife
 
-    a_c, b1_c, b2_c: one wear curve per compound shared by every circuit
-    S: track severity multiplier (1 = average track), e: track evolution.
-    w gets an L2 penalty `alpha`. b1, b2 >= 0 so wear never makes a tyre faster.
+    Within a stint, tyre age and lap number rise together, so they can't be
+    told apart from one stint alone; stints starting at different laps make it
+    possible. Fitted with robust (Huber) regression on raw, non-fuel-corrected
+    lap times. Returns wear (s/lap) and its standard error per compound, the
+    compound offsets vs MEDIUM (s) and the fuel+track LapEffect (s/lap).
+    """
+    comps = [c for c in DRY_COMPOUNDS if (g["Compound"] == c).sum() >= min_laps]
+    g = g[g["Compound"].isin(comps)]
+    if len(comps) < 2 or g["Driver"].nunique() < 5:
+        return None
+    ref = "MEDIUM" if "MEDIUM" in comps else comps[0]
+    X = pd.concat([pd.get_dummies(g["Driver"], dtype=float),
+                   pd.DataFrame({f"off_{c}": (g["Compound"] == c).astype(float)
+                                 for c in comps if c != ref}, index=g.index),
+                   pd.DataFrame({f"wear_{c}": ((g["Compound"] == c) * g["TyreLife"]).astype(float)
+                                 for c in comps}, index=g.index),
+                   g[["LapNumber"]].astype(float)], axis=1)
+    A, y, w = X.to_numpy(), g["LapTimeS"].to_numpy(float), np.ones(len(g))
+    for _ in range(8):                                   # Huber IRLS
+        sw = np.sqrt(w)
+        beta, *_ = np.linalg.lstsq(A * sw[:, None], y * sw, rcond=None)
+        r = y - A @ beta
+        s = 1.4826 * np.median(np.abs(r)) + 1e-9
+        w = np.where(np.abs(r) <= 1.345 * s, 1.0, 1.345 * s / np.abs(r))
+    Aw = A * np.sqrt(w)[:, None]
+    cov = np.linalg.pinv(Aw.T @ Aw) * np.sum(w * r ** 2) / max(len(y) - A.shape[1], 1)
+    b = dict(zip(X.columns, beta)); se = dict(zip(X.columns, np.sqrt(np.clip(np.diag(cov), 0, None))))
+    out = dict(LapEffect=b["LapNumber"], LapEffectSE=se["LapNumber"], ResidMAD=s, NLaps=len(g), Ref=ref)
+    for c in comps:
+        out[f"Wear_{c}"], out[f"WearSE_{c}"] = b[f"wear_{c}"], se[f"wear_{c}"]
+        out[f"Off_{c}"] = 0.0 if c == ref else b[f"off_{c}"]
+        out[f"MaxAge_{c}"] = float(g.loc[g["Compound"] == c, "TyreLife"].quantile(0.95))
+    if ref != "MEDIUM":                                  # no medium: offsets unknown vs MEDIUM
+        for c in comps:
+            out[f"Off_{c}"] = np.nan
+    return out
+
+
+def race_table(d: pd.DataFrame, races: pd.DataFrame, max_se: float = 0.015,
+               verbose: bool = True) -> pd.DataFrame:
+    """Fit every race and return one row per race x compound.
+
+    Estimates that can't be trusted are dropped: wear uncertainty > max_se
+    (usually everyone pitted on the same lap, so wear and lap number can't be
+    separated) or physically impossible values.
+    """
+    info = races[races["Status"] == "ok"].set_index("RaceId")
+    rows = []
+    for rid, g in d.groupby("RaceId"):
+        o = fit_race(g)
+        if not o:
+            continue
+        for c in DRY_COMPOUNDS:
+            if f"Wear_{c}" in o:
+                rows.append(dict(RaceId=rid, Circuit=g["Circuit"].iloc[0], Year=int(g["Year"].iloc[0]),
+                                 Round=int(info.loc[rid, "Round"]), Compound=c, Wear=o[f"Wear_{c}"],
+                                 SE=o[f"WearSE_{c}"], Offset=o[f"Off_{c}"], MaxAge=o[f"MaxAge_{c}"],
+                                 LapEffect=o["LapEffect"], ResidMAD=o["ResidMAD"]))
+    L = pd.DataFrame(rows)
+    n0 = len(L)
+    keep = (L["SE"] < max_se) & L["LapEffect"].between(-0.2, 0.05) & L["Wear"].between(-0.05, 0.3)
+    if verbose:
+        bad = L.loc[~keep, ["RaceId", "Compound", "Wear", "SE"]].round(3)
+        print(f"{n0} race x compound estimates, {int((~keep).sum())} dropped as unreliable")
+        if len(bad):
+            print(bad.to_string(index=False))
+    L = L[keep].reset_index(drop=True)
+    L["Order"] = L["Year"] * 100 + L["Round"]
+    L["CompoundCode"] = L["Compound"].map(COMPOUND_CODE)
+    L["Era2026"] = (L["Year"] >= 2026).astype(int)
+    return L.join(info[TRACK_FEATURES + WEATHER_FEATURES], on="RaceId")
+
+
+# ----------------------------------------------------------- history model
+class HistoryModel:
+    """Predicts a race's tyre numbers from earlier races only.
+
+    For a circuit, compound and season:
+      1. prior   = this season's average so far, shrunk toward the all-time
+                   median (k_season pseudo-races) - captures yearly tyre changes
+      2. predict = this circuit's past values, shrunk toward the prior
+                   (k_circuit pseudo-races) - few past races -> trust the prior
+    Used for wear (s/lap) and compound offset (s vs MEDIUM). Only a handful of
+    numbers are estimated, so it cannot overfit.
     """
 
-    def __init__(self, alpha: float = 1.0, feats=tuple(TRACK_FEATURES + ["TrackTemp"])):  # noqa
-        self.alpha, self.feats = alpha, feats
+    def __init__(self, k_circuit: float = 3.0, k_season: float = 5.0):
+        self.k_circuit, self.k_season = k_circuit, k_season
 
-    def _unpack(self, th):
-        k = len(list(self.feats))
-        return th[0:3], th[3:6], th[6:9], th[9:9 + k], th[9 + k]
-
-    def _f(self, th, X):
-        a, b1, b2, w, e = self._unpack(th)
-        c = X["CompoundCode"].to_numpy(int)
-        age = X["TyreLife"].to_numpy(float)
-        z = (X[list(self.feats)].to_numpy(float) - self.mu_) / self.sd_
-        sev = np.exp(np.clip(z @ w, -3, 3))
-        return a[c] + sev * (b1[c] * age + b2[c] * age ** 2) + e * X["RaceProgress"].to_numpy(float)
-
-    def fit(self, X, y):
-        from scipy.optimize import least_squares
-        Z = X[list(self.feats)].to_numpy(float)
-        self.mu_, self.sd_ = Z.mean(0), Z.std(0) + 1e-9
-        k, y = len(list(self.feats)), np.asarray(y, float)
-        th0 = np.r_[[0, .4, .8], [.08, .05, .03], [.001] * 3, np.zeros(k), 0.0]
-        lo = np.r_[[-np.inf] * 3, [0] * 6, [-np.inf] * (k + 1)]
-        res = lambda th: np.r_[(self._f(th, X) - y) / np.sqrt(len(y)),
-                               np.sqrt(self.alpha / len(y)) * th[9:9 + k]]
-        self.theta_ = least_squares(res, th0, bounds=(lo, np.inf), loss="soft_l1",
-                                    f_scale=0.5).x
+    def fit(self, L: pd.DataFrame):
+        self.L_ = L.copy()
         return self
 
-    def predict(self, X):
-        return self._f(self.theta_, X)
+    def _one(self, A, circuit, year, compound, col):
+        a = A[(A["Compound"] == compound)].dropna(subset=[col])
+        if a.empty:
+            return np.nan
+        prior = a[col].median()
+        s = a.loc[a["Year"] == year, col]
+        prior = (s.sum() + self.k_season * prior) / (len(s) + self.k_season)
+        h = a.loc[a["Circuit"] == circuit, col]
+        return (h.sum() + self.k_circuit * prior) / (len(h) + self.k_circuit)
 
-    def severity(self, X) -> np.ndarray:
-        """Track severity multiplier for rows of X (1.0 = average circuit)."""
-        _, _, _, w, _ = self._unpack(self.theta_)
-        z = (X[list(self.feats)].to_numpy(float) - self.mu_) / self.sd_
-        return np.exp(np.clip(z @ w, -3, 3))
+    def predict_one(self, circuit, year, compound, before=None, col="Wear"):
+        A = self.L_ if before is None else self.L_[self.L_["Order"] < before]
+        return self._one(A, circuit, year, compound, col)
 
-    def coef_table(self) -> pd.DataFrame:
-        a, b1, b2, w, e = self._unpack(self.theta_)
-        rows = [dict(term=f"{c} {n}", value=v) for i, c in enumerate(COMPOUND_CODE)
-                for n, v in (("offset a", a[i]), ("wear b1", b1[i]), ("wear b2", b2[i]))]
-        rows += [dict(term=f"severity w[{f}]", value=v) for f, v in zip(list(self.feats), w)]
-        rows.append(dict(term="track evolution e (s, start->finish)", value=e))
-        return pd.DataFrame(rows)
+    def predict(self, B: pd.DataFrame, before=None) -> np.ndarray:
+        return np.array([self.predict_one(r.Circuit, r.Year, r.Compound, before) for r in B.itertuples()])
+
+
+# ------------------------------------------------------- model comparison
+MODEL_FEATURES = ["CompoundCode", "Era2026"] + TRACK_FEATURES + ["TrackTemp", "AirTemp"]
 
 
 def candidate_models(random_state: int = 0) -> dict:
-    """Models compared, from simplest to most flexible. Hyper-parameters are
-    deliberately conservative (shallow trees, big leaves) to limit overfitting."""
-    from sklearn.compose import ColumnTransformer
+    """Race-level models compared against the history model. Tree models get
+    conservative settings (shallow, big leaves) to limit overfitting."""
     from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
     from sklearn.linear_model import Ridge
     from sklearn.pipeline import make_pipeline
-    from sklearn.preprocessing import OneHotEncoder, PolynomialFeatures, StandardScaler
+    from sklearn.preprocessing import StandardScaler
     from sklearn.tree import DecisionTreeRegressor
-
-    base = ColumnTransformer([("c", OneHotEncoder(drop="first"), ["CompoundCode"]),
-                              ("a", PolynomialFeatures(2, include_bias=False), ["TyreLife"])])
-    mono = [1 if f == "TyreLife" else 0 for f in FEATURES]   # delta can only grow with age
     return {
-        "Baseline (compound + age only)": (make_pipeline(base, Ridge(1.0)),
-                                           ["CompoundCode", "TyreLife"]),
-        "Ridge (poly-2, all features)": (make_pipeline(StandardScaler(),
-                                         PolynomialFeatures(2, include_bias=False),
-                                         StandardScaler(), Ridge(10.0)), FEATURES),
-        "Decision tree": (DecisionTreeRegressor(max_depth=8, min_samples_leaf=200,
-                                                random_state=random_state), FEATURES),
-        "Random forest": (RandomForestRegressor(n_estimators=150, max_depth=12,
-                          min_samples_leaf=100, max_features=0.6, max_samples=0.5,
-                          n_jobs=-1, random_state=random_state), FEATURES),
-        "Gradient boosting (monotonic)": (HistGradientBoostingRegressor(
-            max_depth=6, learning_rate=0.05, max_iter=400, min_samples_leaf=200,
-            l2_regularization=1.0, monotonic_cst=mono, early_stopping=True,
-            validation_fraction=0.15, random_state=random_state), FEATURES),
-        "Structured (compound curve x track severity)": (StructuredDeg(alpha=1.0), FEATURES),
+        "Ridge (features + history)": make_pipeline(StandardScaler(), Ridge(20.0)),
+        "Decision tree (features + history)": DecisionTreeRegressor(max_depth=3, min_samples_leaf=10,
+                                                                    random_state=random_state),
+        "Random forest (features + history)": RandomForestRegressor(
+            300, min_samples_leaf=5, max_features=0.5, n_jobs=-1, random_state=random_state),
+        "Gradient boosting (features + history)": HistGradientBoostingRegressor(
+            max_depth=3, learning_rate=0.05, max_iter=200, min_samples_leaf=10,
+            l2_regularization=1.0, random_state=random_state),
     }
 
 
-def _scores(y, p):
-    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-    return dict(MAE=mean_absolute_error(y, p), RMSE=float(np.sqrt(mean_squared_error(y, p))),
-                R2=r2_score(y, p))
+def _history_feature(A: pd.DataFrame, B: pd.DataFrame, hm: HistoryModel) -> np.ndarray:
+    hm.fit(A)
+    return hm.predict(B)
 
 
-def compare_models(d: pd.DataFrame, n_splits: int = 5, models: dict | None = None):
-    """Leave-circuits-out cross-validation.
+def _history_feature_oof(A: pd.DataFrame, hm: HistoryModel) -> np.ndarray:
+    """History feature for training rows, each computed without its own race."""
+    out = np.empty(len(A))
+    for rid, idx in A.groupby("RaceId").indices.items():
+        out[idx] = _history_feature(A[A["RaceId"] != rid], A.iloc[idx], hm)
+    return out
 
-    Folds are split by Circuit (all years of a track go to the same fold), so
-    every test score is for tracks the model has never seen - the honest test
-    for a generic model. A random-split score is also reported: when it is much
-    better than the grouped one, the model is memorising circuits (overfitting).
-    The train-vs-test gap shows overfitting within the training data.
+
+def compare_models(L: pd.DataFrame, test_from: int = 202501, models: dict | None = None):
+    """Forward-chaining validation: every race from `test_from` on is predicted
+    using ONLY the races before it (exactly how the model would be used before
+    a race weekend). Reports error on those races (Test), error on the data each
+    model was trained on (Train) and the gap between them (overfitting).
     """
     from sklearn.base import clone
-    from sklearn.model_selection import GroupKFold, KFold
-
     models = models or candidate_models()
-    y, groups = d[TARGET].to_numpy(), d["Circuit"].to_numpy()
-    n_splits = min(n_splits, len(np.unique(groups)))
-    rows, oof = [], {}
-    for name, (est, feats) in models.items():
-        X = d[feats]
-        pred = np.zeros(len(d))
-        tr_sc, te_sc = [], []
-        for tr, te in GroupKFold(n_splits).split(X, y, groups):
-            m = clone(est).fit(X.iloc[tr], y[tr])
-            pred[te] = m.predict(X.iloc[te])
-            tr_sc.append(_scores(y[tr], m.predict(X.iloc[tr]))["MAE"])
-            te_sc.append(_scores(y[te], pred[te])["MAE"])
-        rnd = np.zeros(len(d))
-        for tr, te in KFold(n_splits, shuffle=True, random_state=0).split(X):
-            rnd[te] = clone(est).fit(X.iloc[tr], y[tr]).predict(X.iloc[te])
-        s = _scores(y, pred)
-        rows.append(dict(Model=name, Test_MAE=s["MAE"], Test_RMSE=s["RMSE"], Test_R2=s["R2"],
-                         Train_MAE=np.mean(tr_sc), Overfit_gap=np.mean(te_sc) - np.mean(tr_sc),
-                         Fold_MAE_std=np.std(te_sc), RandomSplit_MAE=_scores(y, rnd)["MAE"]))
-        oof[name] = pred
-    res = pd.DataFrame(rows).sort_values("Test_MAE").reset_index(drop=True)
-    return res, oof
-
-
-def tree_depth_curve(d: pd.DataFrame, depths=range(2, 21, 2), n_splits: int = 5):
-    """Train vs unseen-circuit error of a decision tree as depth grows - shows
-    where extra complexity stops helping and starts overfitting."""
-    from sklearn.model_selection import GroupKFold
-    from sklearn.tree import DecisionTreeRegressor
-    X, y, g = d[FEATURES], d[TARGET].to_numpy(), d["Circuit"].to_numpy()
-    n_splits = min(n_splits, len(np.unique(g)))
+    L = L.reset_index(drop=True)
+    names = ["Compound average", "Circuit history (HistoryModel)"] + list(models)
+    pred = {n: np.full(len(L), np.nan) for n in names}
+    train_err = {n: [] for n in names}
+    hm = HistoryModel()
+    for o in sorted(L.loc[L["Order"] >= test_from, "Order"].unique()):
+        A, B = L[L["Order"] < o].reset_index(drop=True), L[L["Order"] == o]
+        if len(A) < 30:
+            continue
+        cavg = A.groupby("Compound")["Wear"].median()
+        pred["Compound average"][B.index] = B["Compound"].map(cavg)
+        train_err["Compound average"].append(np.mean(np.abs(A["Compound"].map(cavg) - A["Wear"])))
+        hA, hB = _history_feature_oof(A, hm), _history_feature(A, B, hm)
+        pred["Circuit history (HistoryModel)"][B.index] = hB
+        train_err["Circuit history (HistoryModel)"].append(np.mean(np.abs(hA - A["Wear"])))
+        Xa, Xb = A[MODEL_FEATURES].assign(History=hA), B[MODEL_FEATURES].assign(History=hB)
+        for n, est in models.items():
+            m = clone(est).fit(Xa, A["Wear"])
+            pred[n][B.index] = m.predict(Xb)
+            train_err[n].append(np.mean(np.abs(m.predict(Xa) - A["Wear"])))
+    test = L["Order"] >= test_from
+    y = L.loc[test, "Wear"].to_numpy()
     rows = []
-    for depth in depths:
-        tr_e, te_e = [], []
-        for tr, te in GroupKFold(n_splits).split(X, y, g):
-            m = DecisionTreeRegressor(max_depth=depth, min_samples_leaf=20, random_state=0)
-            m.fit(X.iloc[tr], y[tr])
-            tr_e.append(np.mean(np.abs(m.predict(X.iloc[tr]) - y[tr])))
-            te_e.append(np.mean(np.abs(m.predict(X.iloc[te]) - y[te])))
-        rows.append(dict(depth=depth, train_MAE=np.mean(tr_e), test_MAE=np.mean(te_e)))
-    return pd.DataFrame(rows)
+    for n in names:
+        p = pred[n][test.to_numpy()]
+        ok = ~np.isnan(p)
+        mae = np.mean(np.abs(p[ok] - y[ok]))
+        rows.append(dict(Model=n, Test_MAE=mae, Test_R2=1 - np.sum((p[ok] - y[ok]) ** 2) / np.sum((y[ok] - y[ok].mean()) ** 2),
+                         Train_MAE=np.mean(train_err[n]), Overfit_gap=mae - np.mean(train_err[n]),
+                         N_test=int(ok.sum())))
+    return pd.DataFrame(rows).sort_values("Test_MAE").reset_index(drop=True), pred
 
 
-def fit_final(d: pd.DataFrame, name: str, models: dict | None = None):
-    from sklearn.base import clone
-    est, feats = (models or candidate_models())[name]
-    return clone(est).fit(d[feats], d[TARGET]), feats
+def tree_depth_curve(L: pd.DataFrame, depths=range(1, 11), test_from: int = 202501):
+    """Decision tree train vs test error as depth grows (forward-chaining)."""
+    from sklearn.tree import DecisionTreeRegressor
+    trees = {f"depth {k}": DecisionTreeRegressor(max_depth=k, min_samples_leaf=3, random_state=0)
+             for k in depths}
+    res, _ = compare_models(L, test_from, trees)
+    res = res.set_index("Model")
+    return pd.DataFrame([dict(depth=k, train_MAE=res.loc[f"depth {k}", "Train_MAE"],
+                              test_MAE=res.loc[f"depth {k}", "Test_MAE"]) for k in depths])
 
 
-def permutation_importance_table(model, feats, d: pd.DataFrame, n: int = 20000, seed: int = 0):
+def feature_importance(L: pd.DataFrame, seed: int = 0) -> pd.DataFrame:
+    """Permutation importance of a random forest on all race-level data."""
+    from sklearn.ensemble import RandomForestRegressor
     from sklearn.inspection import permutation_importance
-    s = d.sample(min(n, len(d)), random_state=seed)
-    r = permutation_importance(model, s[feats], s[TARGET], n_repeats=5, random_state=seed,
+    hm = HistoryModel()
+    X = L[MODEL_FEATURES].assign(History=_history_feature_oof(L.reset_index(drop=True), hm))
+    m = RandomForestRegressor(300, min_samples_leaf=5, max_features=0.5, random_state=seed, n_jobs=-1)
+    m.fit(X, L["Wear"])
+    r = permutation_importance(m, X, L["Wear"], n_repeats=10, random_state=seed,
                                scoring="neg_mean_absolute_error")
-    return (pd.DataFrame(dict(Feature=feats, MAE_increase=r.importances_mean, std=r.importances_std))
+    return (pd.DataFrame(dict(Feature=X.columns, MAE_increase=r.importances_mean, std=r.importances_std))
             .sort_values("MAE_increase", ascending=False).reset_index(drop=True))
 
 
@@ -346,88 +429,67 @@ def permutation_importance_table(model, feats, d: pd.DataFrame, n: int = 20000, 
 def _circuit_rows(races: pd.DataFrame, circuit: str) -> pd.DataFrame:
     from .data import _norm
     ok = races[races["Status"] == "ok"]
-    m = ok["Circuit"].map(_norm).str.contains(_norm(circuit), regex=False) | \
-        ok["EventName"].map(_norm).str.contains(_norm(circuit), regex=False)
+    q = _norm(circuit)
+    m = (ok["Circuit"].map(_norm).str.contains(q, regex=False)
+         | ok["EventName"].map(_norm).str.contains(q, regex=False))
     return ok[m]
 
 
-def track_profile(races: pd.DataFrame, circuit: str, **overrides) -> dict:
-    """Feature values for a circuit = average of its past (dry) editions.
+def resolve_circuit(races: pd.DataFrame, name: str) -> str:
+    """'Sao Paulo' / 'Brazil' / 'Interlagos' -> the circuit name used in the data."""
+    rows = _circuit_rows(races, name)
+    if rows.empty:
+        raise ValueError(f"No past races found for '{name}'")
+    return rows["Circuit"].mode().iloc[0]
 
-    Pass overrides for anything known in advance, e.g. a forecast
-    TrackTemp=45. For a brand-new circuit, pass every TRACK_FEATURE yourself.
-    """
+
+def track_profile(races: pd.DataFrame, circuit: str) -> dict:
+    """Race length, pit loss and safety-car rate from a circuit's past races."""
     rows = _circuit_rows(races, circuit)
-    dry = rows[~rows["Rain"].fillna(False).astype(bool)]
-    rows = dry if len(dry) else rows
-    if rows.empty and not all(k in overrides for k in TRACK_FEATURES):
-        raise ValueError(f"No past races at '{circuit}'. Pass {TRACK_FEATURES} as keyword args.")
-    prof = {k: float(rows[k].mean()) if len(rows) else np.nan
-            for k in TRACK_FEATURES + WEATHER_FEATURES}
-    prof.update(TotalLaps=int(rows["TotalLaps"].median()) if len(rows) else None,
-                PitLoss=float(rows["PitLoss"].median()) if len(rows) else np.nan,
-                P_SC=float(rows["HadSC"].mean()) if len(rows) else np.nan,
-                Editions=len(rows),
-                Circuit=rows["Circuit"].iloc[0] if len(rows) else circuit)
-    prof.update(overrides)
-    return prof
+    if rows.empty:
+        raise ValueError(f"No past races at '{circuit}'")
+    return dict(Circuit=rows["Circuit"].mode().iloc[0], Editions=len(rows),
+                TotalLaps=int(rows["TotalLaps"].median()),
+                PitLoss=float(rows["PitLoss"].median()),
+                P_SC=float(rows["HadSC"].mean()))
 
 
-def predict_curves(model, feats, profile: dict, max_age: int = 50,
-                   race_progress: float = 0.5) -> pd.DataFrame:
-    """Predicted delta vs tyre age for each dry compound at this track.
-    race_progress is fixed (default mid-race) so track evolution does not
-    leak into the tyre curves."""
-    ages = np.arange(1, max_age + 1)
-    rows = []
-    for comp, code in COMPOUND_CODE.items():
-        X = pd.DataFrame({"TyreLife": ages, "CompoundCode": code, "RaceProgress": race_progress,
-                          **{k: profile[k] for k in TRACK_FEATURES + WEATHER_FEATURES}})
-        rows.append(pd.DataFrame(dict(Compound=comp, TyreLife=ages,
-                                      Delta=model.predict(X[feats]))))
-    return pd.concat(rows, ignore_index=True)
+def predict_deg_models(hm: HistoryModel, circuit: str, year: int, before: int | None = None,
+                       cv_mae: float = float("nan")) -> dict[str, DegModel]:
+    """Turn history-model predictions into per-compound DegModels for notebook 02.
 
-
-def predict_deg_models(model, feats, profile: dict, train: pd.DataFrame,
-                       cv_rmse: float = float("nan")) -> dict[str, DegModel]:
-    """Turn the generic model's curves into per-compound DegModel objects so
-    the existing strategy optimiser (notebook 02) can use them unchanged.
-
-    Max usable stint per compound = 95th percentile of tyre age seen for that
-    compound in training (the model is not trusted beyond what it has seen).
+    delta(age) = offset vs MEDIUM + wear * age. Max stint per compound = the
+    longest stints usually seen (95th pct of tyre age) at this circuit, else overall.
     """
-    max_seen = train.groupby("Compound")["TyreLife"].quantile(0.95).round().astype(int)
-    cur = predict_curves(model, feats, profile, max_age=int(train["TyreLife"].max()))
+    L = hm.L_ if before is None else hm.L_[hm.L_["Order"] < before]
     out = {}
-    for comp, g in cur.groupby("Compound"):
-        g = g[g["TyreLife"] <= max_seen[comp]]
-        p = np.polyfit(g["TyreLife"], g["Delta"], 2)
-        out[comp] = DegModel(comp, "generic", [float(p[2]), float(p[1]), float(p[0])],
-                             float(cv_rmse), int(len(train[train["Compound"] == comp])),
-                             int(max_seen[comp]), None)
+    for c in DRY_COMPOUNDS:
+        wear = hm.predict_one(circuit, year, c, before, "Wear")
+        off = hm.predict_one(circuit, year, c, before, "Offset")
+        if np.isnan(wear):
+            continue
+        a = L[(L["Compound"] == c) & (L["Circuit"] == circuit)]["MaxAge"]
+        a = a if len(a) else L[L["Compound"] == c]["MaxAge"]
+        out[c] = DegModel(c, "history", [float(0.0 if np.isnan(off) else off), float(wear)],
+                          float(cv_mae), int((L["Compound"] == c).sum()), int(round(a.median())), None)
     return out
 
 
-def holdout_check(d: pd.DataFrame, races: pd.DataFrame, circuit: str, name: str):
-    """Train on every other circuit, predict this one, and compare with the
-    curve fitted directly to its own laps (what notebook 01 would give)."""
-    from .degradation import fit_all
-    from .data import _norm
-    names = set(_circuit_rows(races, circuit)["Circuit"])   # 'Sao Paulo' -> 'Interlagos'
-    mask = d["Circuit"].isin(names) | d["Circuit"].map(_norm).str.contains(_norm(circuit), regex=False)
-    if not mask.any():
-        raise ValueError(f"'{circuit}' not in the cleaned dataset")
-    model, feats = fit_final(d[~mask], name)
-    prof = track_profile(races, circuit)
-    gen = predict_deg_models(model, feats, prof, d[~mask])
-    own = fit_all(d[mask])
+def holdout_check(L: pd.DataFrame, races: pd.DataFrame, circuit: str, hm: HistoryModel | None = None):
+    """Predict the circuit's most recent race using only races before it, and
+    compare with what the race-fit measured."""
+    hm = (hm or HistoryModel()).fit(L)
+    c = resolve_circuit(races, circuit)
+    last = L[L["Circuit"] == c]
+    if last.empty:
+        raise ValueError(f"No usable dry races at {c}")
+    o = last["Order"].max()
+    actual = last[last["Order"] == o]
     rows = []
-    for c in own:
-        if c in gen:
-            age = np.arange(1, min(own[c].max_age_seen, gen[c].max_age_seen) + 1)
-            err = gen[c].predict(age) - own[c].predict(age)
-            rows.append(dict(Compound=c, Own_deg=own[c].deg_per_lap, Generic_deg=gen[c].deg_per_lap,
-                             Own_offset=own[c].predict(1).item(),
-                             Generic_offset=gen[c].predict(1).item(),
-                             Curve_MAE=float(np.mean(np.abs(err)))))
-    return pd.DataFrame(rows), own, gen
+    for r in actual.itertuples():
+        rows.append(dict(Race=r.RaceId, Compound=r.Compound, Actual_wear=r.Wear,
+                         Predicted_wear=hm.predict_one(c, r.Year, r.Compound, before=o),
+                         Compound_avg=L[(L["Order"] < o) & (L["Compound"] == r.Compound)]["Wear"].median()))
+    t = pd.DataFrame(rows)
+    t["Error"] = t["Predicted_wear"] - t["Actual_wear"]
+    return t

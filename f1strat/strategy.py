@@ -113,19 +113,29 @@ def _react(setup, seq, pits, sc, window):
 
 
 def monte_carlo(setup: RaceSetup, candidates: pd.DataFrame, n_sims: int = 5000,
-                p_sc: float = 0.5, window: int = 6, seed: int = 0):
-    """Simulate candidate plans under random safety cars.
+                p_sc: float = 0.5, window: int = 6, seed: int = 0, wear_sd: float = 0.0):
+    """Simulate candidate plans under random safety cars and uncertain tyre wear.
+
+    wear_sd (s/lap): in each simulated race every compound's wear rate is
+    shifted by a random N(0, wear_sd) amount (the same for all plans in that
+    race), so plans that rely on a tyre lasting long are penalised when wear is
+    uncertain. Use the model's prediction error (e.g. ~0.024 s/lap).
 
     Returns (summary, times) where times is an (n_sims x n_candidates) array.
     """
     rng = np.random.default_rng(seed)
     cand = candidates.reset_index(drop=True)
     times = np.empty((n_sims, len(cand)))
+    comps = list(setup.models)
     for s in range(n_sims):
         sc = sample_safety_cars(setup.total_laps, rng, p_sc)
+        shift = dict(zip(comps, rng.normal(0, wear_sd, len(comps)))) if wear_sd > 0 else None
         for j, r in cand.iterrows():
             pits = _react(setup, r.Seq, r.PitLaps, sc, window)
             times[s, j] = race_time(setup, r.Seq, pits, sc)
+            if shift:   # extra wear over a stint of n laps = shift * (1 + 2 + ... + n)
+                times[s, j] += sum(shift[c] * n * (n + 1) / 2
+                                   for c, n in zip(r.Seq, _stints(pits, setup.total_laps)))
     # Ties (e.g. M-H vs H-M with identical stints) share the win equally.
     best = times <= times.min(1, keepdims=True) + 1e-9
     wins = (best / best.sum(1, keepdims=True)).mean(0)
