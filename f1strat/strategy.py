@@ -1,10 +1,4 @@
-"""Pit strategy optimisation on top of the degradation models.
-
-Race time is computed relative to a driver's baseline pace:
-    T = sum over stints of sum_{age=1..n} delta_compound(age) + n_stops * pit_loss
-Fuel burn and safety-car lap time are the same for every strategy, so they
-cancel out of the comparison and are left out.
-"""
+"""Pit strategy optimisation on top of the degradation models."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -19,10 +13,10 @@ from .degradation import DegModel
 @dataclass
 class RaceSetup:
     total_laps: int
-    pit_loss: float = 21.0          # s, green-flag stop (pit lane + stationary)
-    pit_loss_sc: float = 11.0       # s, stop under safety car
+    pit_loss: float = 21.0
+    pit_loss_sc: float = 11.0
     min_stint: int = 5
-    stint_cap_factor: float = 1.25  # max stint = factor * longest stint seen in data
+    stint_cap_factor: float = 1.25
     models: dict[str, DegModel] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -44,7 +38,7 @@ def _stints(pit_laps, total):
 
 
 def race_time(setup: RaceSetup, compounds, pit_laps, sc_laps: set | None = None) -> float:
-    """Total relative race time. pit_laps = last lap of each stint before the stop."""
+    """Total race time relative to baseline pace; pit_laps = last lap of each stint."""
     lens = _stints(pit_laps, setup.total_laps)
     t = sum(setup.stint_time(c, n) for c, n in zip(compounds, lens))
     for lap in pit_laps:
@@ -53,7 +47,7 @@ def race_time(setup: RaceSetup, compounds, pit_laps, sc_laps: set | None = None)
 
 
 def _valid(setup, compounds, lens):
-    if len(set(compounds)) < 2:          # dry race: must use two different compounds
+    if len(set(compounds)) < 2:
         return False
     return all(setup.min_stint <= n <= setup.max_stint(c) for c, n in zip(compounds, lens))
 
@@ -97,8 +91,7 @@ def sample_safety_cars(total_laps, rng, p_sc=0.5, dur=(3, 5)):
 
 
 def _react(setup, seq, pits, sc, window):
-    """Opportunistic rule: if a planned stop is within `window` laps of the SC,
-    move it to the first SC lap (if the resulting stints stay legal)."""
+    """If a planned stop is within `window` laps of a safety car, move it to the first SC lap."""
     if not sc:
         return pits
     first = min(sc)
@@ -114,15 +107,7 @@ def _react(setup, seq, pits, sc, window):
 
 def monte_carlo(setup: RaceSetup, candidates: pd.DataFrame, n_sims: int = 5000,
                 p_sc: float = 0.5, window: int = 6, seed: int = 0, wear_sd: float = 0.0):
-    """Simulate candidate plans under random safety cars and uncertain tyre wear.
-
-    wear_sd (s/lap): in each simulated race every compound's wear rate is
-    shifted by a random N(0, wear_sd) amount (the same for all plans in that
-    race), so plans that rely on a tyre lasting long are penalised when wear is
-    uncertain. Use the model's prediction error (e.g. ~0.024 s/lap).
-
-    Returns (summary, times) where times is an (n_sims x n_candidates) array.
-    """
+    """Simulate candidate plans under random safety cars and uncertain tyre wear."""
     rng = np.random.default_rng(seed)
     cand = candidates.reset_index(drop=True)
     times = np.empty((n_sims, len(cand)))
@@ -133,10 +118,9 @@ def monte_carlo(setup: RaceSetup, candidates: pd.DataFrame, n_sims: int = 5000,
         for j, r in cand.iterrows():
             pits = _react(setup, r.Seq, r.PitLaps, sc, window)
             times[s, j] = race_time(setup, r.Seq, pits, sc)
-            if shift:   # extra wear over a stint of n laps = shift * (1 + 2 + ... + n)
+            if shift:
                 times[s, j] += sum(shift[c] * n * (n + 1) / 2
                                    for c, n in zip(r.Seq, _stints(pits, setup.total_laps)))
-    # Ties (e.g. M-H vs H-M with identical stints) share the win equally.
     best = times <= times.min(1, keepdims=True) + 1e-9
     wins = (best / best.sum(1, keepdims=True)).mean(0)
     summ = cand[["Compounds", "PitLaps", "RaceTime"]].copy()
@@ -145,4 +129,4 @@ def monte_carlo(setup: RaceSetup, candidates: pd.DataFrame, n_sims: int = 5000,
     summ["P10"] = np.percentile(times, 10, axis=0)
     summ["P90"] = np.percentile(times, 90, axis=0)
     summ["WinRate"] = wins
-    return summ, times  # summary rows line up with columns of `times`
+    return summ, times

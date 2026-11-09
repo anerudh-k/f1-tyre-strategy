@@ -11,8 +11,8 @@ import pandas as pd
 @dataclass
 class DegModel:
     compound: str
-    kind: str              # "linear" or "quadratic"
-    coefs: list            # [c0, c1, (c2)] for delta = c0 + c1*age + c2*age^2
+    kind: str
+    coefs: list
     rmse: float
     n_laps: int
     max_age_seen: int
@@ -40,8 +40,7 @@ def _cv_rmse(x, y, deg, k=5, seed=0):
 
 
 def find_cliff(age, delta, min_seg: int = 5):
-    """Two-segment piecewise-linear fit; returns the breakpoint age if the
-    second slope is clearly steeper (>2x) than the first, else None."""
+    """Breakpoint age of a two-segment linear fit if the second slope is clearly steeper, else None."""
     age, delta = np.asarray(age, float), np.asarray(delta, float)
     ages = np.unique(age)
     if len(ages) < 2 * min_seg:
@@ -62,7 +61,6 @@ def fit_compound(df: pd.DataFrame, compound: str) -> DegModel:
     d = df[df["Compound"] == compound]
     x, y = d["TyreLife"].to_numpy(float), d["Delta"].to_numpy(float)
     lin, quad = _cv_rmse(x, y, 1), _cv_rmse(x, y, 2)
-    # Prefer linear unless quadratic is meaningfully better (>2%) and curvature is positive.
     pq = np.polyfit(x, y, 2)
     use_quad = quad < 0.98 * lin and pq[0] > 0
     if use_quad:

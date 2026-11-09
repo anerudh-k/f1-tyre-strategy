@@ -1,13 +1,4 @@
-"""Generic (multi-circuit) tyre degradation model.
-
-One model is trained on every dry race OpenF1 has. It predicts the
-fuel-corrected lap-time delta of a lap from tyre age, compound, race progress
-(track evolution), weather and features that describe the circuit, so it can
-produce degradation curves for any track, including one it was not trained on.
-
-Pipeline:  build_dataset -> clean_dataset (outliers) -> compare_models
-           (leave-circuits-out CV) -> fit_final -> predict_deg_models.
-"""
+"""Generic (multi-circuit) tyre degradation model."""
 from __future__ import annotations
 
 import numpy as np
@@ -44,26 +35,20 @@ def _race_features(raw: pd.DataFrame) -> dict:
 
 def build_dataset(years=(2023, 2024, 2025), cache_dir: str = "data/cache",
                   fuel_start_kg: float = 100.0, sec_per_kg: float = 0.03, verbose: bool = True):
-    """Download and assemble every race in `years`.
-
-    Returns (laps, races):
-      laps  - one row per clean lap with target `Delta` and all features
-      races - one row per race: data-quality numbers, track/weather features,
-              pit-loss estimate, whether it rained or had a safety car
-    """
+    """Download and assemble every race in `years`."""
     lap_frames, race_rows = [], []
     for year in years:
         for r in list_races(year, cache_dir).itertuples():
             tag = f"{year} R{r.Round:02d} {r.EventName}"
             try:
                 sess, raw = load_race(year, r.Round, cache_dir, with_position=False)
-            except NoDataError as e:   # cancelled / future / unpublished: expected, not an error
+            except NoDataError as e:
                 race_rows.append(dict(Year=year, Round=r.Round, EventName=r.EventName,
                                       Circuit=r.Circuit, Status=f"skipped: {e}"))
                 if verbose:
                     print(f"{tag:45s} skipped - {e}")
                 continue
-            except Exception as e:      # anything else is recorded, not fatal
+            except Exception as e:
                 race_rows.append(dict(Year=year, Round=r.Round, EventName=r.EventName,
                                       Circuit=r.Circuit, Status=f"FAILED: {type(e).__name__}: {e}"[:150]))
                 if verbose:
@@ -80,8 +65,6 @@ def build_dataset(years=(2023, 2024, 2025), cache_dir: str = "data/cache",
                                    .agg(lambda s: (s.astype(str) != "1").mean() > 0.5).sum()),
                         HadSC=bool((raw["TrackStatus"].astype(str) == "4").any()),
                         WetLaps=wet_laps, RainfallSeen=sess.weather["Rain"],
-                        # wet race = more than 10% of laps on inters/wets (a few laps
-                        # on inters at a dry race are just a gamble, not a wet race)
                         Rain=wet_laps > 0.10 * len(raw),
                         PitLoss=pit_loss_from_session(raw),
                         **{f"Laps_{c}": comps.get(c, 0) for c in DRY_COMPOUNDS},
@@ -112,8 +95,7 @@ def build_dataset(years=(2023, 2024, 2025), cache_dir: str = "data/cache",
 
 
 def _impute_track_features(laps, races, verbose=True):
-    """A missing circuit descriptor (e.g. a broken speed trap) is filled with the
-    same circuit's value from other years, so one bad sensor doesn't drop a race."""
+    """Fill a missing circuit feature with the same circuit's value from other years."""
     cols = TRACK_FEATURES + WEATHER_FEATURES
     ok = races["Status"] == "ok"
     for c in cols:
@@ -151,16 +133,7 @@ def stint_slopes(laps: pd.DataFrame, min_laps: int = 5) -> pd.DataFrame:
 def clean_dataset(laps: pd.DataFrame, races: pd.DataFrame, z_max: float = 3.5,
                   max_slope: float = 0.4, min_race_laps: int = 200, age_pct: float = 0.99,
                   verbose: bool = True):
-    """Remove outliers in layers and report what each layer dropped.
-
-    1. wet races (rain or inter/wet tyres used)       - different physics
-    2. races with too few clean laps                    - unreliable features
-    3. stints shorter than 5 laps or with a non-physical slope
-       (|slope| > max_slope s/lap)                      - bad stint/compound data
-    4. lap residual outliers: robust z (MAD) of the residual from a per
-       race/compound linear fit, |z| > z_max            - traffic, errors, mis-timed laps
-    5. tyre ages beyond the 99th percentile per compound - too few points to learn
-    """
+    """Remove outliers in layers and report what each layer dropped."""
     log, d = [], laps.copy()
     log.append(("start", len(d)))
     wet = races.loc[races["Rain"].eq(True), "RaceId"]
@@ -170,10 +143,9 @@ def clean_dataset(laps: pd.DataFrame, races: pd.DataFrame, z_max: float = 3.5,
     d = d[n >= min_race_laps]
     log.append((f"races < {min_race_laps} laps", len(d)))
 
-    # stint-level check first, so the lap filter can't hide a corrupted stint
     sl = stint_slopes(d)
     key = ["RaceId", "Driver", "Stint"]
-    d = d.merge(sl[key], on=key, how="inner")            # drops stints < 5 laps
+    d = d.merge(sl[key], on=key, how="inner")
     log.append(("stints < 5 laps", len(d)))
     bad = sl.loc[sl["Slope"].abs() > max_slope, key]
     d = d.merge(bad.assign(_bad=1), on=key, how="left")
@@ -206,17 +178,7 @@ def clean_dataset(laps: pd.DataFrame, races: pd.DataFrame, z_max: float = 3.5,
 
 # ------------------------------------------------------- per-race tyre model
 def fit_race(g: pd.DataFrame, min_laps: int = 40) -> dict | None:
-    """Separate tyre wear from fuel burn + track evolution for ONE race.
-
-        LapTime = driver pace + compound offset + LapEffect * LapNumber
-                  + Wear_compound * TyreLife
-
-    Within a stint, tyre age and lap number rise together, so they can't be
-    told apart from one stint alone; stints starting at different laps make it
-    possible. Fitted with robust (Huber) regression on raw, non-fuel-corrected
-    lap times. Returns wear (s/lap) and its standard error per compound, the
-    compound offsets vs MEDIUM (s) and the fuel+track LapEffect (s/lap).
-    """
+    """Separate tyre wear from fuel burn + track evolution for one race."""
     comps = [c for c in DRY_COMPOUNDS if (g["Compound"] == c).sum() >= min_laps]
     g = g[g["Compound"].isin(comps)]
     if len(comps) < 2 or g["Driver"].nunique() < 5:
@@ -229,7 +191,7 @@ def fit_race(g: pd.DataFrame, min_laps: int = 40) -> dict | None:
                                  for c in comps}, index=g.index),
                    g[["LapNumber"]].astype(float)], axis=1)
     A, y, w = X.to_numpy(), g["LapTimeS"].to_numpy(float), np.ones(len(g))
-    for _ in range(8):                                   # Huber IRLS
+    for _ in range(8):
         sw = np.sqrt(w)
         beta, *_ = np.linalg.lstsq(A * sw[:, None], y * sw, rcond=None)
         r = y - A @ beta
@@ -243,7 +205,7 @@ def fit_race(g: pd.DataFrame, min_laps: int = 40) -> dict | None:
         out[f"Wear_{c}"], out[f"WearSE_{c}"] = b[f"wear_{c}"], se[f"wear_{c}"]
         out[f"Off_{c}"] = 0.0 if c == ref else b[f"off_{c}"]
         out[f"MaxAge_{c}"] = float(g.loc[g["Compound"] == c, "TyreLife"].quantile(0.95))
-    if ref != "MEDIUM":                                  # no medium: offsets unknown vs MEDIUM
+    if ref != "MEDIUM":
         for c in comps:
             out[f"Off_{c}"] = np.nan
     return out
@@ -251,12 +213,7 @@ def fit_race(g: pd.DataFrame, min_laps: int = 40) -> dict | None:
 
 def race_table(d: pd.DataFrame, races: pd.DataFrame, max_se: float = 0.015,
                verbose: bool = True) -> pd.DataFrame:
-    """Fit every race and return one row per race x compound.
-
-    Estimates that can't be trusted are dropped: wear uncertainty > max_se
-    (usually everyone pitted on the same lap, so wear and lap number can't be
-    separated) or physically impossible values.
-    """
+    """Fit every race and return one row per race x compound."""
     info = races[races["Status"] == "ok"].set_index("RaceId")
     rows = []
     for rid, g in d.groupby("RaceId"):
@@ -286,16 +243,7 @@ def race_table(d: pd.DataFrame, races: pd.DataFrame, max_se: float = 0.015,
 
 # ----------------------------------------------------------- history model
 class HistoryModel:
-    """Predicts a race's tyre numbers from earlier races only.
-
-    For a circuit, compound and season:
-      1. prior   = this season's average so far, shrunk toward the all-time
-                   median (k_season pseudo-races) - captures yearly tyre changes
-      2. predict = this circuit's past values, shrunk toward the prior
-                   (k_circuit pseudo-races) - few past races -> trust the prior
-    Used for wear (s/lap) and compound offset (s vs MEDIUM). Only a handful of
-    numbers are estimated, so it cannot overfit.
-    """
+    """Predicts a race's tyre numbers from earlier races only."""
 
     def __init__(self, k_circuit: float = 3.0, k_season: float = 5.0):
         self.k_circuit, self.k_season = k_circuit, k_season
@@ -327,8 +275,7 @@ MODEL_FEATURES = ["CompoundCode", "Era2026"] + TRACK_FEATURES + ["TrackTemp", "A
 
 
 def candidate_models(random_state: int = 0) -> dict:
-    """Race-level models compared against the history model. Tree models get
-    conservative settings (shallow, big leaves) to limit overfitting."""
+    """Race-level models compared against the history model."""
     from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
     from sklearn.linear_model import Ridge
     from sklearn.pipeline import make_pipeline
@@ -360,11 +307,7 @@ def _history_feature_oof(A: pd.DataFrame, hm: HistoryModel) -> np.ndarray:
 
 
 def compare_models(L: pd.DataFrame, test_from: int = 202501, models: dict | None = None):
-    """Forward-chaining validation: every race from `test_from` on is predicted
-    using ONLY the races before it (exactly how the model would be used before
-    a race weekend). Reports error on those races (Test), error on the data each
-    model was trained on (Train) and the gap between them (overfitting).
-    """
+    """Forward-chaining validation: each race from `test_from` on is predicted from earlier races only."""
     from sklearn.base import clone
     models = models or candidate_models()
     L = L.reset_index(drop=True)
@@ -456,11 +399,7 @@ def track_profile(races: pd.DataFrame, circuit: str) -> dict:
 
 def predict_deg_models(hm: HistoryModel, circuit: str, year: int, before: int | None = None,
                        cv_mae: float = float("nan")) -> dict[str, DegModel]:
-    """Turn history-model predictions into per-compound DegModels for notebook 02.
-
-    delta(age) = offset vs MEDIUM + wear * age. Max stint per compound = the
-    longest stints usually seen (95th pct of tyre age) at this circuit, else overall.
-    """
+    """Turn history-model predictions into per-compound DegModels for notebook 02."""
     L = hm.L_ if before is None else hm.L_[hm.L_["Order"] < before]
     out = {}
     for c in DRY_COMPOUNDS:
@@ -476,8 +415,7 @@ def predict_deg_models(hm: HistoryModel, circuit: str, year: int, before: int | 
 
 
 def holdout_check(L: pd.DataFrame, races: pd.DataFrame, circuit: str, hm: HistoryModel | None = None):
-    """Predict the circuit's most recent race using only races before it, and
-    compare with what the race-fit measured."""
+    """Predict the circuit's most recent race using only races before it, and compare with what the race-fit measured."""
     hm = (hm or HistoryModel()).fit(L)
     c = resolve_circuit(races, circuit)
     last = L[L["Circuit"] == c]

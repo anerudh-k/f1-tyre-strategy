@@ -1,9 +1,4 @@
-"""Loading and cleaning race lap data from OpenF1 (https://openf1.org).
-
-F1's own live-timing server (used by FastF1) returns 403 to cloud machines
-such as Google Colab, so laps, stints, pit stops and race-control messages are
-pulled from the free OpenF1 API instead and reshaped into FastF1-style columns.
-"""
+"""Loading and cleaning race lap data from OpenF1 (https://openf1.org)."""
 from __future__ import annotations
 
 import json
@@ -23,16 +18,11 @@ class NoDataError(RuntimeError):
 
 
 def _get(endpoint: str, cache_dir: str, retries: int = 5, **params) -> list:
-    """GET an OpenF1 endpoint with on-disk JSON caching and retry on rate limits.
-
-    A 4xx answer (other than 429 rate-limit) means "no data for this query" and
-    returns []. Empty answers are not cached, so they are retried next run.
-    """
+    """GET an OpenF1 endpoint with on-disk JSON caching and retry on rate limits."""
     import requests
 
     key = endpoint + "_" + "_".join(f"{k}-{v}" for k, v in sorted(params.items()))
     path = os.path.join(cache_dir, key.replace("/", "-").replace(" ", "") + ".json")
-    # The current season's race list keeps growing: refresh it if older than 12 h
     stale = (endpoint in ("sessions", "meetings")
              and int(params.get("year", 0)) >= time.gmtime().tm_year
              and os.path.exists(path) and time.time() - os.path.getmtime(path) > 12 * 3600)
@@ -46,7 +36,7 @@ def _get(endpoint: str, cache_dir: str, retries: int = 5, **params) -> list:
         if code == 429 or code >= 500:
             time.sleep(2 * (attempt + 1))
             continue
-        time.sleep(0.4)  # stay under the free-tier rate limit
+        time.sleep(0.4)
         if 400 <= code < 500:
             return []
         data = r.json()
@@ -54,7 +44,7 @@ def _get(endpoint: str, cache_dir: str, retries: int = 5, **params) -> list:
             with open(path, "w") as f:
                 json.dump(data, f)
         return data
-    if stale and os.path.exists(path):      # can't refresh: fall back to the old list
+    if stale and os.path.exists(path):
         with open(path) as f:
             return json.load(f)
     raise RuntimeError(f"OpenF1 {endpoint} failed after {retries} tries (HTTP {code})")
@@ -109,16 +99,7 @@ def _find_session(year: int, gp, cache_dir: str, session_name: str = "Race"):
 
 
 def _neutralised_periods(rc: pd.DataFrame) -> list:
-    """(start, end, status) for safety car ('4'), red flag ('5') and VSC ('6').
-
-    State machine over race-control messages:
-      SC  : 'SAFETY CAR DEPLOYED'          -> 'SAFETY CAR IN THIS LAP' (+2 min) or red flag
-      VSC : 'VIRTUAL SAFETY CAR DEPLOYED'  -> 'VIRTUAL SAFETY CAR ENDING' (+30 s)
-      Red : flag RED / 'RED FLAG' / 'SUSPENDED' -> next 'SESSION STARTED' (+3 min, covers
-            the restart lap)
-    Anything still open is capped (SC 25 min, VSC 15 min, red 90 min) so a missing
-    message can never wipe out the rest of the race.
-    """
+    """(start, end, status) for safety car ('4'), red flag ('5') and VSC ('6')."""
     if rc.empty:
         return []
     rc = rc.sort_values("date")
@@ -166,14 +147,7 @@ def _weather_summary(wx: pd.DataFrame) -> dict:
 
 def load_race(year: int, gp: str | int, cache_dir: str = "data/cache",
               session_name: str = "Race", with_position: bool = True):
-    """Load a race (or sprint: session_name="Sprint") from OpenF1 and return (session, laps).
-
-    `laps` has FastF1-style columns: Driver, Team, LapNumber, LapTime, Stint,
-    Compound, TyreLife, PitInTime, PitOutTime, TrackStatus, IsAccurate, Position.
-    Also keeps speed traps (I1/I2/ST speed) and sector times, plus Year/Circuit.
-    `session.event["EventName"]` holds the GP name; `session.weather` holds
-    race-average track/air temperature, humidity and whether it rained.
-    """
+    """Load a race (or sprint) from OpenF1 and return (session, laps) with FastF1-style columns."""
     os.makedirs(cache_dir, exist_ok=True)
     sess, meetings = _find_session(year, gp, cache_dir, session_name)
     sk = sess["session_key"]
@@ -200,16 +174,14 @@ def load_race(year: int, gp: str | int, cache_dir: str = "data/cache",
     df["date_start"] = pd.to_datetime(df["date_start"], utc=True, format="ISO8601")
     df["LapTime"] = pd.to_timedelta(df["lap_duration"], unit="s")
 
-    # Driver code / team
     if not drivers.empty:
         d = drivers.drop_duplicates("driver_number").set_index("driver_number")
         df["Driver"] = df["driver_number"].map(d["name_acronym"]).fillna(df["driver_number"].astype(str))
         df["Team"] = df["driver_number"].map(d["team_name"])
-    else:   # driver list unavailable: use car numbers
+    else:
         df["Driver"] = "#" + df["driver_number"].astype(str)
         df["Team"] = None
 
-    # Stint, compound and tyre age from the stints table
     df["Stint"], df["Compound"], df["TyreLife"] = np.nan, None, np.nan
     for st in stints.itertuples():
         if pd.isna(st.lap_start):
@@ -222,7 +194,6 @@ def load_race(year: int, gp: str | int, cache_dir: str = "data/cache",
         age0 = st.tyre_age_at_start if pd.notna(st.tyre_age_at_start) else 0
         df.loc[m, "TyreLife"] = age0 + df.loc[m, "lap_number"] - st.lap_start + 1
 
-    # Pit in-laps (OpenF1 lap_number = lap the car entered the pits) and out-laps
     df["PitInTime"] = pd.Series(pd.NaT, index=df.index, dtype="timedelta64[ns]")
     df["PitOutTime"] = pd.Series(pd.NaT, index=df.index, dtype="timedelta64[ns]")
     if not pits.empty:
@@ -231,13 +202,11 @@ def load_race(year: int, gp: str | int, cache_dir: str = "data/cache",
         df.loc[m, "PitInTime"] = pd.Timedelta(1, "s")
     out = df["is_pit_out_lap"].fillna(False).astype(bool)
     df.loc[out, "PitOutTime"] = pd.Timedelta(1, "s")
-    # Some races have no pit records: the lap before an out-lap is the in-lap
     prev = df[out][["driver_number", "lap_number"]].assign(lap_number=lambda x: x.lap_number - 1)
     pin2 = set(zip(prev["driver_number"], prev["lap_number"]))
     m2 = [(a, b) in pin2 for a, b in zip(df["driver_number"], df["lap_number"])]
     df.loc[m2, "PitInTime"] = pd.Timedelta(1, "s")
 
-    # Track status per lap from SC / VSC / red-flag periods
     df["TrackStatus"] = "1"
     if not rc.empty:
         rc["date"] = pd.to_datetime(rc["date"], utc=True, format="ISO8601")
@@ -248,7 +217,6 @@ def load_race(year: int, gp: str | int, cache_dir: str = "data/cache",
 
     df["IsAccurate"] = df["lap_duration"].notna() & df["date_start"].notna()
 
-    # Final classified position (for comparing with actual strategies)
     if not pos.empty:
         final = pos.sort_values("date").groupby("driver_number")["position"].last()
         df["Position"] = df["driver_number"].map(final)
@@ -266,12 +234,7 @@ def load_race(year: int, gp: str | int, cache_dir: str = "data/cache",
 
 
 def clean_laps(laps: pd.DataFrame, outlier_pct: float = 1.07) -> pd.DataFrame:
-    """Keep representative green-flag laps on dry tyres.
-
-    Removes: lap 1, in/out laps, non-green laps (SC/VSC/yellow), laps FastF1
-    marks as inaccurate, wet/inter tyres, and slow outliers (> outlier_pct of
-    the driver's median, which catches traffic and mistakes).
-    """
+    """Keep representative green-flag laps on dry tyres."""
     df = pd.DataFrame(laps).copy()
     df = df[df["LapTime"].notna() & (df["LapNumber"] > 1)]
     df = df[df["PitInTime"].isna() & df["PitOutTime"].isna()]
@@ -291,28 +254,18 @@ def clean_laps(laps: pd.DataFrame, outlier_pct: float = 1.07) -> pd.DataFrame:
 
 def fuel_correct(df: pd.DataFrame, total_laps: int, fuel_start_kg: float = 100.0,
                  sec_per_kg: float = 0.03) -> pd.DataFrame:
-    """Remove the fuel-burn effect so lap-time change reflects tyre wear only.
-
-    Assumes linear fuel burn from fuel_start_kg to ~0 at the flag. The
-    defaults are typical public estimates; treat them as assumptions and
-    run a sensitivity check.
-    """
+    """Remove the fuel-burn effect so lap-time change reflects tyre wear only."""
     df = df.copy()
     fuel_left = fuel_start_kg * (1 - (df["LapNumber"] - 1) / total_laps)
     df["FuelKg"] = fuel_left
     df["LapTimeCorr"] = df["LapTimeS"] - sec_per_kg * fuel_left
-    # Per-driver baseline so drivers of different pace can be pooled.
     df["Delta"] = df["LapTimeCorr"] - df.groupby("Driver")["LapTimeCorr"].transform(
         lambda s: s.quantile(0.10))
     return df
 
 
 def pit_loss_from_session(laps: pd.DataFrame) -> float:
-    """Rough pit loss estimate: median (in-lap + out-lap) minus 2x normal lap.
-
-    Falls back to NaN if not enough clean stops. Check against known values
-    for the track before trusting it.
-    """
+    """Rough green-flag pit loss: median (in-lap + out-lap) minus two normal laps."""
     df = pd.DataFrame(laps).copy()
     df["LapTimeS"] = df["LapTime"].dt.total_seconds()
     green = df[(df["TrackStatus"].astype(str) == "1") & df["PitInTime"].isna()
