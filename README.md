@@ -2,10 +2,18 @@
 
 Fits tyre degradation curves from real F1 race laps ([OpenF1](https://openf1.org)) and uses them to find the fastest pit strategy, including how robust it is when a safety car shows up.
 
-<!-- After running on real data, drop your key figures here, e.g.
-![Degradation](figures/degradation_curves.png)
-![One-stop window](figures/one_stop_window.png)
--->
+## Results
+
+Trained on 90 races from 2023 to 2026 and tested by predicting every 2025-26 race from earlier races only.
+
+- Fuel burn plus track evolution is worth about -0.06 s/lap, the same size as tyre wear. Separating the two gives median wear of 0.055 (Soft), 0.052 (Medium) and 0.045 s/lap (Hard).
+- A history model (the circuit's past races, adjusted toward the current season) predicts race tyre wear with an error of 0.024 s/lap. Ridge, decision tree, random forest and gradient boosting on circuit features did not beat it, and the tree models overfit.
+- For Las Vegas 2026 the best plan is a one-stop on Soft and Hard, fastest in about 52% of 5,000 simulated races with random safety cars and uncertain wear. A two-stop never pays at this track.
+
+![Model comparison](figures/model_comparison.png)
+![Decision tree depth vs error](figures/tree_depth_curve.png)
+![Predicted tyre wear, Las Vegas 2026](figures/predicted_target.png)
+![Monte Carlo strategy comparison](figures/monte_carlo.png)
 
 ## What it does
 
@@ -20,18 +28,15 @@ Fits tyre degradation curves from real F1 race laps ([OpenF1](https://openf1.org
 - Brute-forces every legal 1-stop and 2-stop plan (two dry compounds required, stint lengths capped near what the data supports)
 - Plots the one-stop pit window and a two-stop pit-lap map
 - Finds the pit-loss threshold at which a two-stop beats a one-stop
-- Runs a Monte Carlo safety-car simulation (pit under SC if a stop is due within 6 laps) and reports the time distribution and win rate for each plan
+- Runs a Monte Carlo simulation with random safety cars (pit under SC if a stop is due within 6 laps) and, for generic-model predictions, uncertain tyre wear; reports the time distribution and win rate for each plan
 - Compares the optimum against what the top 10 finishers actually ran
 
 **Part 3: Generic model, any circuit** (`notebooks/03_generic_model.ipynb`)
-- Downloads every race OpenF1 has (2023 onwards) and builds one lap-level dataset
-- Data-quality report per race, then EDA: laps per compound, delta vs tyre age, degradation by circuit, feature correlations
-- Layered outlier removal (wet races, short/non-physical stints, robust MAD z-score on lap residuals, rare tyre ages), with a report of what each layer removed
-- Compares six models (compound-only baseline, Ridge, decision tree, random forest, monotonic gradient boosting, and a physics-structured model) using **leave-circuits-out** cross-validation, so every score is for tracks the model never saw. Overfitting is checked with the train/test gap, a random-split comparison and a tree-depth curve
-- Hold-out check: retrain without the target circuit and compare against its own data
-- Predicts degradation curves, pit loss and safety-car rate for any GP and saves them in the format notebook 02 reads
-
-The structured model is `Delta = a_c + S(track) * (b1_c * age + b2_c * age^2) + e * race_progress`: one wear curve per compound shared by every circuit, scaled by a track-severity factor `S = exp(w . track_features)`, plus a track-evolution term. It has only ~17 parameters, so it overfits far less than the tree models and can extrapolate to circuits outside the training range.
+- Downloads every race on OpenF1 (2023 onwards, ~90 dry races), with a data-quality report per race
+- EDA, then layered outlier removal (wet races, short/impossible stints, robust MAD z-score on lap residuals, rare tyre ages) with a report of what each layer removed
+- **Per-race tyre model:** `lap time = driver pace + compound offset + (fuel + track evolution) × lap + wear × tyre age`, fitted with robust regression. Fuel and track evolution (about −0.06 s/lap) are the same size as tyre wear and get mixed into it when stints are fitted one at a time
+- **Prediction:** compares a history model (the circuit's past races shrunk toward the season average) with Ridge, a decision tree, a random forest and gradient boosting on circuit features. Uses **forward-chaining validation**: every 2025–26 race is predicted from earlier races only. Overfitting is checked with the train/test gap and a tree-depth curve
+- Predicts wear, compound offsets, pit loss and safety-car rate for any GP, plus the model's error, which notebook 02 uses as wear uncertainty in its Monte Carlo
 
 ## Model
 
@@ -58,7 +63,7 @@ f1strat/
   data.py          # OpenF1 loading, lap cleaning, fuel correction, pit-loss estimate
   degradation.py   # per-compound fits, CV model selection, cliff detection
   strategy.py      # strategy enumeration, Monte Carlo safety-car simulation
-  generic.py       # multi-circuit dataset, outlier removal, model comparison, prediction
+  generic.py       # multi-circuit dataset, outlier removal, per-race tyre model, history model, validation
 notebooks/         # 01 single-race degradation / 03 generic model -> 02 strategy
 data/              # cached OpenF1 responses + fitted models (json)
 figures/           # saved plots
@@ -71,7 +76,8 @@ Lap times, tyre stints, pit stops and race-control messages come from the free [
 ## Assumptions and limitations
 
 - Fuel: 100 kg at the start, 0.03 s/kg (both are configurable and sensitivity-checked)
-- Notebook 01 fits a single race, so track evolution gets folded into the deg rate (notebook 03 models it separately)
+- Notebook 01 fits stints one at a time, so track evolution gets folded into the deg rate (notebook 03's per-race model separates them)
+- Tyre wear is modelled as linear in tyre age (no cliff)
 - OpenF1 reports SOFT/MEDIUM/HARD, not Pirelli's C1–C5, so the same label can be a different compound at different tracks; the circuit features absorb part of this
 - 2026 is a new regulation era, so check whether pre-2026 seasons help or hurt when predicting 2026 races
 - Stint order only matters through the safety-car timing, because track position, overtaking difficulty and the undercut/overcut are not modelled yet
